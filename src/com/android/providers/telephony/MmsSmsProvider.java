@@ -105,6 +105,11 @@ public class MmsSmsProvider extends ContentProvider {
      */
     private static final String TABLE_CANONICAL_ADDRESSES = "canonical_addresses";
 
+    /**
+     * the name of the table that is used to store the conversation threads.
+     */
+    static final String TABLE_THREADS = "threads";
+
     // These constants are used to construct union queries across the
     // MMS and SMS base tables.
 
@@ -122,7 +127,7 @@ public class MmsSmsProvider extends ContentProvider {
         Mms.READ_STATUS, Mms.RESPONSE_STATUS, Mms.RESPONSE_TEXT,
         Mms.RETRIEVE_STATUS, Mms.RETRIEVE_TEXT_CHARSET, Mms.REPORT_ALLOWED,
         Mms.READ_REPORT, Mms.STATUS, Mms.SUBJECT, Mms.SUBJECT_CHARSET,
-        Mms.TRANSACTION_ID, Mms.MMS_VERSION };
+        Mms.TRANSACTION_ID, Mms.MMS_VERSION, Mms.TEXT_ONLY };
 
     // These are the columns that appear only in the SMS message
     // table.
@@ -164,6 +169,10 @@ public class MmsSmsProvider extends ContentProvider {
     private static final String[] ID_PROJECTION = { BaseColumns._ID };
 
     private static final String[] EMPTY_STRING_ARRAY = new String[0];
+
+    private static final String[] SEARCH_STRING = new String[1];
+    private static final String SEARCH_QUERY = "SELECT snippet(words, '', ' ', '', 1, 1) as " +
+            "snippet FROM words WHERE index_text MATCH ? ORDER BY snippet LIMIT 50;";
 
     private static final String SMS_CONVERSATION_CONSTRAINT = "(" +
             Sms.TYPE + " != " + Sms.MESSAGE_TYPE_DRAFT + ")";
@@ -348,12 +357,11 @@ public class MmsSmsProvider extends ContentProvider {
                         sortOrder);
                 break;
             case URI_SEARCH_SUGGEST: {
-                String searchString = uri.getQueryParameter("pattern");
+                SEARCH_STRING[0] = uri.getQueryParameter("pattern") + '*' ;
 
                 // find the words which match the pattern using the snippet function.  The
                 // snippet function parameters mainly describe how to format the result.
                 // See http://www.sqlite.org/fts3.html#section_4_2 for details.
-                String query = String.format("SELECT snippet(words, '', ' ', '', 1, 1) as snippet FROM words WHERE index_text MATCH '%s*' ORDER BY snippet LIMIT 50;", searchString);
                 if (       sortOrder != null
                         || selection != null
                         || selectionArgs != null
@@ -363,7 +371,7 @@ public class MmsSmsProvider extends ContentProvider {
                             "with this query");
                 }
 
-                cursor = db.rawQuery(query, null);
+                cursor = db.rawQuery(SEARCH_QUERY, SEARCH_STRING);
                 break;
             }
             case URI_MESSAGE_ID_TO_THREAD: {
@@ -462,7 +470,9 @@ public class MmsSmsProvider extends ContentProvider {
                 throw new IllegalStateException("Unrecognized URI:" + uri);
         }
 
-        cursor.setNotificationUri(getContext().getContentResolver(), MmsSms.CONTENT_URI);
+        if (cursor != null) {
+            cursor.setNotificationUri(getContext().getContentResolver(), MmsSms.CONTENT_URI);
+        }
         return cursor;
     }
 
@@ -593,7 +603,7 @@ public class MmsSmsProvider extends ContentProvider {
         }
         values.put(ThreadsColumns.MESSAGE_COUNT, 0);
 
-        long result = mOpenHelper.getWritableDatabase().insert("threads", null, values);
+        long result = mOpenHelper.getWritableDatabase().insert(TABLE_THREADS, null, values);
         Log.d(LOG_TAG, "insertThread: created new thread_id " + result +
                 " for recipientIds " + /*recipientIds*/ "xxxxxxx");
 
@@ -613,8 +623,12 @@ public class MmsSmsProvider extends ContentProvider {
         Set<Long> addressIds = getAddressIds(recipients);
         String recipientIds = "";
 
-        // optimize for size==1, which should be most of the cases
-        if (addressIds.size() == 1) {
+        if (addressIds.size() == 0) {
+            Log.e(LOG_TAG, "getThreadId: NO receipients specified -- NOT creating thread",
+                    new Exception());
+            return null;
+        } else if (addressIds.size() == 1) {
+            // optimize for size==1, which should be most of the cases
             for (Long addressId : addressIds) {
                 recipientIds = Long.toString(addressId);
             }
@@ -628,24 +642,35 @@ public class MmsSmsProvider extends ContentProvider {
         }
 
         String[] selectionArgs = new String[] { recipientIds };
+
         SQLiteDatabase db = mOpenHelper.getReadableDatabase();
-        Cursor cursor = db.rawQuery(THREAD_QUERY, selectionArgs);
-
-        if (cursor.getCount() == 0) {
-            cursor.close();
-
-            Log.d(LOG_TAG, "getThreadId: create new thread_id for recipients " +
-                    /*recipients*/ "xxxxxxxx");
-            insertThread(recipientIds, recipients.size());
-
-            db = mOpenHelper.getReadableDatabase();  // In case insertThread closed it
+        db.beginTransaction();
+        Cursor cursor = null;
+        try {
+            // Find the thread with the given recipients
             cursor = db.rawQuery(THREAD_QUERY, selectionArgs);
+
+            if (cursor.getCount() == 0) {
+                // No thread with those recipients exists, so create the thread.
+                cursor.close();
+
+                Log.d(LOG_TAG, "getThreadId: create new thread_id for recipients " +
+                        /*recipients*/ "xxxxxxxx");
+                insertThread(recipientIds, recipients.size());
+
+                // The thread was just created, now find it and return it.
+                cursor = db.rawQuery(THREAD_QUERY, selectionArgs);
+            }
+            db.setTransactionSuccessful();
+        } catch (Throwable ex) {
+            Log.e(LOG_TAG, ex.getMessage(), ex);
+        } finally {
+            db.endTransaction();
         }
 
-        if (cursor.getCount() > 1) {
+        if (cursor != null && cursor.getCount() > 1) {
             Log.w(LOG_TAG, "getThreadId: why is cursorCount=" + cursor.getCount());
         }
-
         return cursor;
     }
 
@@ -691,7 +716,7 @@ public class MmsSmsProvider extends ContentProvider {
      */
     private Cursor getSimpleConversations(String[] projection, String selection,
             String[] selectionArgs, String sortOrder) {
-        return mOpenHelper.getReadableDatabase().query("threads", projection,
+        return mOpenHelper.getReadableDatabase().query(TABLE_THREADS, projection,
                 selection, selectionArgs, null, null, " date DESC");
     }
 
@@ -996,7 +1021,7 @@ public class MmsSmsProvider extends ContentProvider {
         String[] columns = handleNullThreadsProjection(projection);
 
         queryBuilder.setDistinct(true);
-        queryBuilder.setTables("threads");
+        queryBuilder.setTables(TABLE_THREADS);
         return queryBuilder.query(
                 mOpenHelper.getReadableDatabase(), columns, finalSelection,
                 selectionArgs, sortOrder, null, null);
@@ -1168,12 +1193,12 @@ public class MmsSmsProvider extends ContentProvider {
                 MmsSmsDatabaseHelper.updateAllThreads(db, null, null);
                 break;
             case URI_OBSOLETE_THREADS:
-                affectedRows = db.delete("threads",
-                        "_id NOT IN (SELECT DISTINCT thread_id FROM sms " +
-                        "UNION SELECT DISTINCT thread_id FROM pdu)", null);
+                affectedRows = db.delete(TABLE_THREADS,
+                        "_id NOT IN (SELECT DISTINCT thread_id FROM sms where thread_id NOT NULL " +
+                        "UNION SELECT DISTINCT thread_id FROM pdu where thread_id NOT NULL)", null);
                 break;
             default:
-                throw new UnsupportedOperationException(NO_DELETES_INSERTS_OR_UPDATES);
+                throw new UnsupportedOperationException(NO_DELETES_INSERTS_OR_UPDATES + uri);
         }
 
         if (affectedRows > 0) {
@@ -1197,7 +1222,12 @@ public class MmsSmsProvider extends ContentProvider {
 
     @Override
     public Uri insert(Uri uri, ContentValues values) {
-        throw new UnsupportedOperationException(NO_DELETES_INSERTS_OR_UPDATES);
+        if (URI_MATCHER.match(uri) == URI_PENDING_MSG) {
+            SQLiteDatabase db = mOpenHelper.getWritableDatabase();
+            long rowId = db.insert(TABLE_PENDING_MSG, null, values);
+            return Uri.parse(uri + "/" + rowId);
+        }
+        throw new UnsupportedOperationException(NO_DELETES_INSERTS_OR_UPDATES + uri);
     }
 
     @Override
@@ -1227,7 +1257,7 @@ public class MmsSmsProvider extends ContentProvider {
 
             default:
                 throw new UnsupportedOperationException(
-                        NO_DELETES_INSERTS_OR_UPDATES);
+                        NO_DELETES_INSERTS_OR_UPDATES + uri);
         }
 
         if (affectedRows > 0) {
